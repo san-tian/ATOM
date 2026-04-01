@@ -123,6 +123,7 @@ class MockConfig:
             stop_token_ids=[],
             scheduler_delay_factor=0.0,
             speculative_config=None,
+            enable_chunked_prefill=False,
         )
         defaults.update(overrides)
         for k, v in defaults.items():
