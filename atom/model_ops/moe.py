@@ -28,6 +28,7 @@ from atom.model_ops.fused_moe.config import (
     FusedMoEQuantConfig,
     fp8_w8a8_moe_quant_config,
     mxfp4_w4a16_moe_quant_config,
+    mxfp4_w4a8_moe_quant_config,
 )
 from atom.model_ops.fused_moe.modular_kernel import (
     FusedMoEModularKernel,
@@ -55,6 +56,9 @@ from atom.utils.decorators import mark_trace
 from torch import nn
 from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
+
+import logging
+logger = logging.getLogger("atom") # debug help
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -688,10 +692,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton = gfx.startswith("gfx94") or (
             gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
         )
-        if self.use_triton:
-            from atom.model_ops.utils import has_triton_kernels
-
-            assert has_triton_kernels(), "triton_kernels is not installed"
 
     def create_weights(
         self,
@@ -725,7 +725,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition_after_pad,
+                2 * intermediate_size_per_partition_after_pad, # TP included
                 hidden_size // 2,
                 dtype=weight_dtype,
             )
@@ -765,7 +765,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             torch.empty(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition_after_pad // 2,
+                intermediate_size_per_partition_after_pad // 2, # TP included
                 dtype=weight_dtype,
             )
         )
@@ -818,11 +818,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
+        # logger.warning("processed weights")
+        # logger.warning(layer.w13_weight)
+        # logger.warning(layer.w2_weight)
+
 
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
+            from atom.config import get_current_atom_config
+
+            atom_config = get_current_atom_config()
             #from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
+            
             w13_weight, w13_scale, w2_weight, w2_scale = _swizzle_mxfp4(
                 layer.w13_weight.view(torch.uint8),
                 layer.w13_weight_scale,
@@ -833,9 +841,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.hidden_size,#K_1,   --  FC1
                 self.hidden_size,#N_2,   --  FC2
                 self.intermediate_size,#K_2,   --  FC2
-                #TP
+                atom_config.tensor_parallel_size#TP
             )
-
+            # w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
+            #     layer.w13_weight.view(torch.uint8),
+            #     layer.w13_weight_scale,
+            # )
+            # w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
+            #     layer.w2_weight.view(torch.uint8),
+            #     layer.w2_weight_scale,
+            # )
             # self.w13_precision_config = PrecisionConfig(
             #     weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
             # )
@@ -913,6 +928,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
+        # logger.warning("moe mxfp4 quant config")
+        # logger.warning(layer.config)
+        #TODO -- implement layer.config activations
+        # if layer.config or something has fp8 activations, return w4a8 version of below
+        logger.warning("self.moe.a_quant_dtype checkkkkkk")
+        logger.warning(self.moe.a_quant_dtype)
+        a1_scale = getattr(layer, "w13_input_scale", None)
+        a2_scale = getattr(layer, "w2_input_scale", None)
+            
+        # TODO: make more flexible
+        if (self.moe.a_quant_dtype == "fp8_e4m3"):
+            return mxfp4_w4a8_moe_quant_config(
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
         return mxfp4_w4a16_moe_quant_config(
             w1_bias=layer.w13_bias,
             w2_bias=layer.w2_bias,
@@ -956,6 +990,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or custom_routing_function is not None
             )
 
+            # logger.warning("layer weights in forward")
+            # logger.warning(layer.w13_weight)
+            # logger.warning(layer.w2_weight)
+
             if needs_custom_routing:
                 # Use ATOM's full-featured select_experts for routing,
                 # then triton matmul_ogs for the actual MoE computation.
@@ -982,6 +1020,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 routing_data, gather_idx, scatter_idx = routing_from_topk(
                     topk_weights, topk_ids, n_expts_tot
                 )
+                x_q_dtype = self.moe.a_quant_dtype if self.moe.a_quant_dtype == "fp8_e4m3" else None
 
                 output = torch.empty_like(x)
                 _moe_result = triton_kernel_fused_experts(
@@ -995,18 +1034,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     topk=top_k,
                     activation=activation,
                     w13_scale=layer.w13_weight_scale,
-                    w2_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
                     w1_bias=layer.w13_bias,
                     w2_bias=layer.w2_bias,
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     global_num_experts=global_num_experts,
                     expert_map=expert_map,
+                    x_q_dtype=x_q_dtype,
                 )
                 return _moe_result
 
             assert (
                 fused_shared_experts_scoring_func is None
             ), "triton kernel does not support fused shared experts func"
+
+            x_q_dtype = self.moe.a_quant_dtype if self.moe.a_quant_dtype == "fp8_e4m3" else None
 
             return triton_kernel_moe_forward(
                 x,
@@ -1023,6 +1065,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 expert_map=expert_map,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
+                x_q_dtype=x_q_dtype,
+                static_scale=self.moe.static_scale
             )
 
         topk_weights, topk_ids = FusedMoE.select_experts(
@@ -1947,6 +1991,8 @@ class FusedMoE(torch.nn.Module):
         )
         self.layer_quant_config = layer_quant_config
         self.has_bias = has_bias
+        # logger.warning("in triton fused moe, here's the config")
+        # logger.warning(config)
         # Note: here we guard against accessing the TP and DP groups when
         # uninitialized (this happens when testing)
         # self.tp_size = 1
@@ -2040,6 +2086,15 @@ class FusedMoE(torch.nn.Module):
 
         self.use_chunked = get_dp_group().world_size > 1
 
+        logger.warning("config in fusedmoe")
+        logger.warning(config)
+
+        # if config is not None
+        #     and hasattr(config, "n_shared_experts")
+        # TODO: implement more checks that this exists and won't error out for other models
+        a_quant_dtype = config.quantization_config.get("global_quant_config", "").get("input_tensors", "").get("dtype", "")
+        
+
         moe = FusedMoEConfig(
             num_experts=self.global_num_experts,
             experts_per_token=self.top_k,
@@ -2047,10 +2102,12 @@ class FusedMoE(torch.nn.Module):
             num_local_experts=self.local_num_experts,
             moe_parallel_config=self.moe_parallel_config,
             in_dtype=atom_config.torch_dtype,
+            a_quant_dtype=a_quant_dtype,
             max_num_tokens=atom_config.max_num_batched_tokens,
             has_bias=self.has_bias,
             # is_act_and_mul=True,
             is_lora_enabled=False,
+            static_scale=torch.tensor(1e-4, device="cuda:0")
         )
         self.moe_config = moe
 
