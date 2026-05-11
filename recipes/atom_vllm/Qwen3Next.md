@@ -31,7 +31,7 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --no-enable-prefix-caching
 ```
 
-**Important**: `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1` is required for Qwen3-Next because it uses a hybrid architecture with both linear attention (GatedDeltaNet) and full attention layers. This env var ensures full attention layers use vLLM's default implementation.
+**Important**: ATOM-vLLM no longer supports disabling only ATOM attention while keeping ATOM models active. Use `ATOM_DISABLE_VLLM_PLUGIN=1` for a pure vLLM run.
 
 ## Step 3: Performance Benchmark
 
@@ -72,7 +72,7 @@ lm_eval --model local-completions \
 
 ## Key Environment Variables
 
-- `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`: **Required** - disables ATOM attention plugin to use vLLM's implementation for full attention layers
+- `ATOM_DISABLE_VLLM_PLUGIN=1`: Optional pure-vLLM control when you do not want to use the ATOM vLLM plugin.
 
 ## Architecture Notes
 

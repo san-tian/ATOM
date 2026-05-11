@@ -12,7 +12,7 @@ import torch
 from atom.config import Config, KVCacheTensor, ParallelConfig
 
 if TYPE_CHECKING:
-    from atom.plugin.attention import MetadataForPluginMode
+    from atom.plugin.vllm.attention.metadata import MetadataForPluginMode
 
 
 def _compute_chunked_local_num_tokens(
