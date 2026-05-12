@@ -35,6 +35,7 @@ logger = logging.getLogger("atom")
 if has_triton_kernels():
     try:
         import triton_kernels.swiglu
+
         try:
             from triton_kernels.matmul import (
                 FnSpecs,
