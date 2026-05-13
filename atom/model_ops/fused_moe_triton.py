@@ -205,6 +205,8 @@ def triton_kernel_moe_forward(
     activation: str = "silu",
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
+    a13_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
     w13_swizzle_layout: torch.Tensor | None = None,
     w2_swizzle_layout: torch.Tensor | None = None,
     w1_bias: torch.Tensor | None = None,
@@ -234,6 +236,8 @@ def triton_kernel_moe_forward(
         activation=activation,
         w13_scale=w13_scale,
         w2_scale=w2_scale,
+        a13_scale=a13_scale,
+        a2_scale=a2_scale,
         w13_swizzle_layout=w13_swizzle_layout,
         w2_swizzle_layout=w2_swizzle_layout,
         w1_bias=w1_bias,
@@ -261,6 +265,8 @@ def triton_kernel_fused_experts(
     w2_scale: torch.Tensor | None = None,
     w13_swizzle_layout: torch.Tensor | None = None,
     w2_swizzle_layout: torch.Tensor | None = None,
+    a13_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     swiglu_alpha: float = 1.702,
@@ -277,9 +283,6 @@ def triton_kernel_fused_experts(
     assert hidden_states.dtype == torch.bfloat16
     assert w1_bias is None or w1_bias.dtype == torch.float32
     assert w2_bias is None or w2_bias.dtype == torch.float32
-
-    logger.warning("x_q_dtype")
-    logger.warning(x_q_dtype)
 
     # Shape check, only check non-mxfp4
     assert hidden_states.ndim == 2
@@ -310,6 +313,11 @@ def triton_kernel_fused_experts(
 
     #gammas = routing_data.gate_scal if routing_data else None
 
+    # On account of manual swiglu being required, HIP stream errors, and bench for triton having a 
+    # static scale incorrect for given input states of about -3 - 3, we adjust static scale at 
+    # each point of data loss to avoid overly incorrect results.
+    moving_scale = static_scale
+
     # NOTE: We intentionally do NOT use the triton fused SwiGLU activation
     # because it expects interleaved [gate0, up0, gate1, up1, ...] layout
     # while our w13 weights produce concatenated [gate | up] output.
@@ -335,50 +343,54 @@ def triton_kernel_fused_experts(
     #     y=raw_intermediate,
     # )
     x_q_dtype_base = x_q_dtype.split("_")[0]
-    logger.warning("split")
-    logger.warning(x_q_dtype_base)
+    # logger.warning("split")
+    # logger.warning(x_q_dtype_base)
+    logger.warning("hidden states og")
+    logger.warning(hidden_states)
+    hidden_states_og = hidden_states
     if (x_q_dtype_base == "fp8"):
         from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+        # If input type is fp8, input scales must be available
+        assert a13_scale is not None
+        assert a2_scale is not None
+        logger.warning(a13_scale)
+        logger.warning(a2_scale)
+        a13_scale = a13_scale.max().to(torch.float32)/448
+        a2_scale = a2_scale.max().to(torch.float32)/448
+        logger.warning(a13_scale)
+        logger.warning(a2_scale)
 
         x_dtype = torch.float8_e4m3fn # model is fp8_e4m3 type
 
         if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
             x_dtype = torch.float8_e4m3fnuz
 
-        hidden_states = downcast_to_static_fp8(hidden_states, static_scale)
+        hidden_states = downcast_to_static_fp8(hidden_states, a13_scale)
+        quick_test = hidden_states.to(torch.bfloat16) * a13_scale
         logger.warning("hidden states")
         logger.warning(hidden_states)
+        logger.warning(quick_test)
         raw_intermediate = moe_gemm_a8w4(
             hidden_states,
             w1,
             None,
             w13_scale,
-            static_scale,
-            static_scale,
+            a13_scale,
+            None,
             w1_bias,
             routing_data,
             gather_indx=gather_indx,
             swizzle_mx_scale="CDNA4_SCALE", # TODO assuming it's not None for simplicity's sake for now but should be checked
-            out_dtype=raw_intermediate.dtype,#x_dtype
-            apply_swiglu=False,
-        ) 
-    elif (x_q_dtype_base == "mx8"): # basic handling along the lines of mx8 since scale swizzled elsewhere
-        # do not default to mxfp4. quantize to fp8 and run appropriate kernel
-        hidden_states, x_scale = quantize(hidden_states, x_q_dtype_base)
-        raw_intermediate = moe_gemm_a8w4(
-            hidden_states,
-            w1,
-            x_scale,
-            w13_scale,
-            None,
-            None,
-            w1_bias,
-            routing_data,
-            gather_indx=gather_indx,
-            swizzle_mx_scale="CDNA4_SCALE",
             out_dtype=raw_intermediate.dtype,
             apply_swiglu=False,
         ) 
+        #quick_test = downcast_to_static_fp8(raw_intermediate, static_scale)
+        logger.warning("quick test")
+        logger.warning(raw_intermediate)
+        #raw_intermediate = raw_intermediate * moving_scale * moving_scale
+        # logger.warning("raw intermed")
+        logger.warning(raw_intermediate)
     else:
         hidden_states, x_scale = mxfp4_quant(hidden_states)
         raw_intermediate = moe_gemm_a4w4(
@@ -399,9 +411,17 @@ def triton_kernel_fused_experts(
     # Standard SiLU/SwiGLU activation: silu(gate) * up
     # needed for all quant versions
     raw_2d = raw_intermediate.view(M * topk, N)
+    logger.warning("raw 2d")
+    logger.warning(raw_2d)
+    logger.warning(intermediate_cache.shape)
     gate = raw_2d[:, :half_N]
     up = raw_2d[:, half_N:]
-    intermediate_cache[0] = torch.nn.functional.silu(gate) * up
+    logger.warning("issue with swiglu erasing intermediate cache")
+    logger.warning(gate)
+    logger.warning(up)
+    logger.warning(torch.nn.functional.silu(gate))
+    intermediate_cache = torch.nn.functional.silu(gate) * up
+    logger.warning(intermediate_cache.shape)
 
     # matmul_ogs(
     #     intermediate_cache.view(M * topk, half_N),
@@ -415,7 +435,7 @@ def triton_kernel_fused_experts(
     # )
 
 
-    if (x_q_dtype_base == "fp8" or x_q_dtype_base == "mx8"):
+    if (x_q_dtype_base == "fp8"):
         # do not default to mxfp4
         logger.warning("second stage")
         from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -425,13 +445,28 @@ def triton_kernel_fused_experts(
         if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
             x_dtype = torch.float8_e4m3fnuz
 
-        interm_cache = downcast_to_static_fp8(intermediate_cache.view(M * topk, half_N), static_scale)
+        # logger.warning("check intermediate cache is not all gone")
+        # logger.warning(intermediate_cache)
+
+        # logger.warning("moving_scale")
+        # logger.warning(moving_scale)
+
+        # make an adjustment to moving scale to have it be useful for typical interm cache numbers
+        # moving_scale = moving_scale / moving_scale # reset to 1 -- new scalev for second pass
+        # #moving_scale = 
+
+        # logger.warning("moving_scale")
+        # logger.warning(moving_scale)
+
+        interm_cache = downcast_to_static_fp8(intermediate_cache.view(M * topk, half_N), a2_scale)
+        logger.warning("interm_cache")
+        logger.warning(interm_cache)
         output_tensor = moe_gemm_a8w4(
             interm_cache,
             w2,
             None,
             w2_scale,
-            static_scale,
+            a2_scale,
             None,
             w2_bias,
             routing_data,
@@ -440,6 +475,7 @@ def triton_kernel_fused_experts(
         )
         logger.warning("output")
         logger.warning(output_tensor)
+        #logger.warning(output_tensor * static_scale)
     else:
         interm_cache, x_scale = mxfp4_quant(intermediate_cache.view(M * topk, half_N))
         output_tensor = moe_gemm_a4w4(
