@@ -387,7 +387,8 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 ENV PATH="/usr/local/go/bin:${PATH}"
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 2/4] Install Mooncake dependencies =========="; \
-        apt-get update && apt-get install -y --no-install-recommends \
+        apt-get update && apt --fix-broken install -y && \
+        apt-get install -y --no-install-recommends \
             zip unzip wget gcc make libtool autoconf \
             librdmacm-dev rdmacm-utils infiniband-diags perftest ethtool \
             libibverbs-dev rdma-core \
@@ -464,15 +465,6 @@ RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
 # RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
 RUN pip install rocm-trace-lite && \
     rtl --version || true
-
-# ATOM: Python install (editable) + atom-mesh Rust binary
-# CACHEBUST invalidates only this layer so parallel stages stay cached
-ARG CACHEBUST=1
-RUN git clone $ATOM_REPO /app/ATOM && \
-    cd /app/ATOM && \
-    git checkout $ATOM_COMMIT && \
-    pip install -e .
-RUN pip show atom || true
 
 # atom-mesh: build Rust binary, strip, install to /usr/local/bin
 RUN echo "========== Build atom-mesh ==========" && \
