@@ -4,19 +4,29 @@ from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.models.glm4_moe import Glm4MoeForCausalLM
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM
-from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
 from atom.config import Config
 from atom.plugin.prepare import is_vllm, is_sglang
 
 logger = logging.getLogger("atom")
+
+try:
+    from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
+except ImportError as exc:
+    MiniMaxM2ForCausalLM = None
+    logger.warning(
+        "Skip MiniMaxM2ForCausalLM registration because its optional aiter dependency is unavailable: %s",
+        exc,
+    )
 
 _ATOM_SUPPORTED_MODELS = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
-    "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
 }
+
+if MiniMaxM2ForCausalLM is not None:
+    _ATOM_SUPPORTED_MODELS["MiniMaxM2ForCausalLM"] = MiniMaxM2ForCausalLM
 
 if is_sglang():
     from atom.models.qwen3_next import Qwen3NextForCausalLM
