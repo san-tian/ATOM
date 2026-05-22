@@ -92,15 +92,15 @@ def _convert_req_index_to_global_index_kernel(
     block_id = tok // BLOCK_SIZE
     inblock_off = tok % BLOCK_SIZE
 
-    # Guard block_table access
+    # Guard block_table access. Top-k kernels write -1 sentinels for rows
+    # whose valid KV range is shorter than NUM_TOPK_TOKENS. Padded CUDA graph
+    # requests can also carry -1 block table entries. Keep both as -1 so the
+    # sparse MLA kernel ignores them instead of attending to KV slot 0.
     valid_block = (block_id < max_num_blocks_per_req) & (block_id >= 0)
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
-    base = tl.load(bt_ptr, mask=valid_block, other=0)
-
-    # # If token == -1 OR block_id OOB, output 0; else base * BLOCK_SIZE + offset
-    out_val = tl.where(
-        is_invalid_tok | (~valid_block), 0, base * BLOCK_SIZE + inblock_off
-    )
+    base = tl.load(bt_ptr, mask=valid_block & ~is_invalid_tok, other=-1)
+    valid_entry = (~is_invalid_tok) & valid_block & (base >= 0)
+    out_val = tl.where(valid_entry, base * BLOCK_SIZE + inblock_off, -1)
     out_ptr_ij = out_ptr + seq_start + indice_id
     out_ptr_ij_mask = (seq_start + indice_id) < seq_end
 
