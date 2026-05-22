@@ -694,6 +694,7 @@ def sparse_attn_indexer_plugin_mode(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
+        topk_indices_buffer[:num_padded_tokens] = -1
         logits = torch.empty(
             [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
         )
@@ -713,7 +714,7 @@ def sparse_attn_indexer_plugin_mode(
 
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
+        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         top_k_per_row_decode(
             logits,
             next_n,
