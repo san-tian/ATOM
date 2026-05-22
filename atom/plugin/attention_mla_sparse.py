@@ -49,6 +49,7 @@ logger = logging.getLogger("atom")
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
     req_id_ptr,  # int32 [num_tokens]
+    slot_mapping_ptr,  # int64 [num_tokens]
     block_table_ptr,  # int32 [num_requests, max_num_blocks_per_req]
     token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     cu_seqlens_ptr,  # int32 [num_tokens + 1]
@@ -71,8 +72,8 @@ def _convert_req_index_to_global_index_kernel(
     # Each program covers BLOCK_N consecutive columns
     indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    # Load request id for this token (no mask: grid is exact)
     req = tl.load(req_id_ptr + token_id)
+    valid_token = tl.load(slot_mapping_ptr + token_id) >= 0
 
     # Load cumulative sequence lengths to get starting index of this request
     seq_start = tl.load(cu_seqlens_ptr + token_id)
@@ -96,7 +97,7 @@ def _convert_req_index_to_global_index_kernel(
     # whose valid KV range is shorter than NUM_TOPK_TOKENS. Padded CUDA graph
     # requests can also carry -1 block table entries. Keep both as -1 so the
     # sparse MLA kernel ignores them instead of attending to KV slot 0.
-    valid_block = (block_id < max_num_blocks_per_req) & (block_id >= 0)
+    valid_block = valid_token & (block_id < max_num_blocks_per_req) & (block_id >= 0)
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
     base = tl.load(bt_ptr, mask=valid_block & ~is_invalid_tok, other=-1)
     valid_entry = (~is_invalid_tok) & valid_block & (base >= 0)
@@ -110,6 +111,7 @@ def _convert_req_index_to_global_index_kernel(
 
 def triton_convert_req_index_to_global_index(
     req_id: torch.Tensor,  # int32 [num_tokens]
+    slot_mapping: torch.Tensor,  # int64 [num_tokens]
     block_table: torch.Tensor,  # int32 [num_requests, max_num_blocks_per_req]
     token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     cu_seqlens: torch.Tensor,  # int32 [num_tokens + 1]
@@ -129,6 +131,7 @@ def triton_convert_req_index_to_global_index(
         out-of-bounds.
     """
     assert req_id.dtype == torch.int32
+    assert slot_mapping.dtype == torch.int64
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
@@ -142,6 +145,7 @@ def triton_convert_req_index_to_global_index(
 
     # Ensure contiguous tensors on the same device
     req_id_c = req_id.contiguous()
+    slot_mapping_c = slot_mapping.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
 
@@ -154,6 +158,7 @@ def triton_convert_req_index_to_global_index(
 
     _convert_req_index_to_global_index_kernel[grid](
         req_id_c,
+        slot_mapping_c,
         block_table_c,
         token_indices_c,
         cu_seqlens,
@@ -467,6 +472,7 @@ class MLASparseAttentionImplPluginModeMethods:
         topk_indices_i32 = topk_indices.to(dtype=torch.int32)
         triton_convert_req_index_to_global_index(
             req_id_i32,
+            sparse_meta.slot_mapping,
             block_table_i32,
             topk_indices_i32,
             sparse_meta.paged_kv_indptr,

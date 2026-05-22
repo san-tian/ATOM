@@ -1744,6 +1744,7 @@ class AiterMLASparseMetadataForPluginMode:
     paged_kv_last_page_len: torch.Tensor
     paged_kv_indices: torch.Tensor
     paged_kv_indptr: torch.Tensor
+    topk_indices_global: torch.Tensor
     attn_out_dtype: torch.dtype
 
     block_size: int = 1
@@ -1805,6 +1806,8 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
         paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
         paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
+        topk_indices_global = self.topk_indices_global[:num_tokens]
+        topk_indices_global.fill_(-1)
 
         # ----- Compute persistent MLA metadata -----
         # The aiter sparse decode kernel uses qseqlen=1 (each query token is
@@ -1848,6 +1851,7 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
             paged_kv_last_page_len=paged_kv_last_page_len,
             paged_kv_indices=paged_kv_indices,
             paged_kv_indptr=paged_kv_indptr,
+            topk_indices_global=topk_indices_global,
             work_meta_data=self._mla_work_meta_data,
             work_indptr=self._mla_work_indptr,
             work_info_set=self._mla_work_info_set,
@@ -2327,6 +2331,11 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         )
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
+        )
+        self.topk_indices_global = torch.empty(
+            [max_num_batched_tokens, self.topk_tokens],
+            dtype=torch.int32,
+            device=device,
         )
 
         # ----- Persistent MLA metadata buffers -----
