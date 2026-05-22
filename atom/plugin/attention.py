@@ -1774,10 +1774,13 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         req_id_per_token = torch.repeat_interleave(
             torch.arange(seg_lengths.shape[0], dtype=torch.int32), seg_lengths
         )
-        # Zero-fill for cudagraphs
+        # FULL cudagraph replay reuses these backing buffers across layers and
+        # requests. Refresh the full buffers so stale tail entries cannot be
+        # interpreted as KV slot 0 if a later persistent metadata path overreads.
         self.req_id_per_token_buffer.fill_(0)
-        self.paged_kv_indices.fill_(0)
+        self.paged_kv_indices.fill_(-1)
         self.paged_kv_indptr.fill_(0)
+        self.topk_indices_global.fill_(-1)
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
             req_id_per_token, non_blocking=True
         )
@@ -1807,13 +1810,18 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
         paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
         topk_indices_global = self.topk_indices_global[:num_tokens]
-        topk_indices_global.fill_(-1)
 
         # ----- Compute persistent MLA metadata -----
         # The aiter sparse decode kernel uses qseqlen=1 (each query token is
         # treated as its own batch entry), so persistent metadata can always
         # be precomputed here. The kernel switches to the persistent
         # work-stealing path automatically when work_meta_data is non-None.
+        self._mla_work_meta_data.zero_()
+        self._mla_work_indptr.zero_()
+        self._mla_work_info_set.zero_()
+        self._mla_reduce_indptr.zero_()
+        self._mla_reduce_final_map.zero_()
+        self._mla_reduce_partial_map.zero_()
         get_mla_metadata_v1(
             qo_indptr,
             paged_kv_indptr,
@@ -1986,7 +1994,7 @@ class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
             # Clamp to 0 to prevent OOB access in the DeepGEMM kernel.
             # This is safe because padded requests have seq_lens=0, so the
             # kernel produces no meaningful output for those rows.
-            block_table.clamp_(min=0)
+            block_table = block_table.clamp(min=0)
 
             max_decode_len = int(decode_lens_cpu.max().item())
             if max_decode_len > 1:
@@ -2023,7 +2031,7 @@ class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
                 self.expanded_seq_lens_buffer[:actual_expanded] = (
                     expanded_base + positions_within + 1
                 )
-                self.expanded_seq_lens_buffer[actual_expanded:] = 0
+                self.expanded_seq_lens_buffer[actual_expanded:num_decode_tokens] = 0
                 seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
 
                 # Give each of the flattened entries the same block table row as the
@@ -2035,8 +2043,8 @@ class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
                 )
                 if actual_expanded < num_decode_tokens:
                     self.expanded_block_table_buffer[
-                        actual_expanded:num_decode_tokens, 0
-                    ] = 0
+                        actual_expanded:num_decode_tokens
+                    ].fill_(0)
                 block_table = self.expanded_block_table_buffer[:num_decode_tokens]
 
                 # All reqs now have decode_len=1
