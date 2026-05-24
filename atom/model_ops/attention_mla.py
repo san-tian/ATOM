@@ -885,12 +885,14 @@ def _convert_req_index_to_global_index_kernel(
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
         tok = tl.load(ti_ptr)  # int32
 
-        # Guard block_table access
-        valid_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        # Guard block_table access. Top-k kernels write -1 sentinels for rows
+        # whose valid KV range is shorter than NUM_TOPK_TOKENS.
+        store_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        valid_mask = store_mask & (tok >= 0)
         out_val = tl.load(
             kv_indices + kv_start + tok,
             mask=valid_mask,
-            other=0,
+            other=-1,
         )
 
         # Store results
@@ -898,7 +900,7 @@ def _convert_req_index_to_global_index_kernel(
         tl.store(
             out_ptr_ij,
             out_val,
-            mask=valid_mask,
+            mask=store_mask,
         )
 
 
@@ -1113,7 +1115,7 @@ def _gather_kv_indices_sparse_kernel(
     out_val = tl.load(
         kv_indices + kv_base + pos,
         mask=valid_mask,
-        other=0,
+        other=-1,
     )
 
     tl.store(
