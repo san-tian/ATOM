@@ -46,6 +46,90 @@ import logging
 logger = logging.getLogger("atom")
 
 
+def _layer_num_from_prefix(prefix: str) -> int | None:
+    for part in reversed(prefix.split(".")):
+        if part.isdigit():
+            return int(part)
+    return None
+
+
+def _probe_c_log_topk_decode(
+    event: str,
+    *,
+    k_cache_prefix: str,
+    topk_indices: torch.Tensor,
+    topk_indices_buffer: torch.Tensor,
+    decode_metadata,
+    decode_lens: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+    num_decode_tokens: int,
+    num_padded_tokens: int,
+) -> None:
+    from atom.utils.debug_helper import sparse_replay
+
+    if not sparse_replay.should_log_layer(_layer_num_from_prefix(k_cache_prefix)):
+        return
+
+    topk_rows = topk_indices[:num_padded_tokens]
+    valid_rows = min(num_padded_tokens, decode_metadata.seq_lens.shape[0])
+    sparse_replay.maybe_log(
+        event,
+        layer=k_cache_prefix,
+        num_decode_tokens=int(num_decode_tokens),
+        num_padded_tokens=int(num_padded_tokens),
+        batch_size=int(batch_size),
+        next_n=int(next_n),
+        seq_lens_head=sparse_replay.tensor_head(decode_metadata.seq_lens, 8),
+        decode_lens_head=sparse_replay.tensor_head(decode_lens, 8),
+        block_table_head=sparse_replay.tensor_head(decode_metadata.block_table, 16),
+        topk_stats=sparse_replay.tensor_stats(topk_rows),
+        topk_ge_seq_lens=int(
+            sparse_replay.count_ge_by_row(
+                topk_rows, decode_metadata.seq_lens, valid_rows
+            )
+        ),
+        buffer_head=sparse_replay.tensor_head(topk_indices_buffer, 16),
+    )
+
+
+def _probe_c_log_sparse_forward(
+    event: str,
+    *,
+    layer_num: int,
+    num_actual_toks: int,
+    sparse_meta,
+    topk_indices: torch.Tensor,
+) -> None:
+    from atom.utils.debug_helper import sparse_replay
+
+    if not sparse_replay.should_log_layer(layer_num):
+        return
+
+    indptr_last = (
+        int(sparse_meta.paged_kv_indptr[-1].item())
+        if sparse_meta.paged_kv_indptr.numel() > 0
+        else 0
+    )
+    sparse_replay.maybe_log(
+        event,
+        layer_num=int(layer_num),
+        num_actual_toks=int(num_actual_toks),
+        sparse_meta_paged_kv_indptr_last=indptr_last,
+        paged_kv_indptr_head=sparse_replay.tensor_head(sparse_meta.paged_kv_indptr, 8),
+        paged_kv_indices_stats=sparse_replay.tensor_stats(sparse_meta.paged_kv_indices),
+        topk_stats=sparse_replay.tensor_stats(topk_indices),
+        topk_head=sparse_replay.tensor_head(topk_indices, 16),
+        topk_tail=sparse_replay.tensor_tail(topk_indices, 16),
+        paged_kv_indices_head=sparse_replay.tensor_head(
+            sparse_meta.paged_kv_indices, 16
+        ),
+        paged_kv_indices_tail=sparse_replay.tensor_tail(
+            sparse_meta.paged_kv_indices, 16
+        ),
+    )
+
+
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
     req_id_ptr,  # int32 [num_tokens]
@@ -470,6 +554,13 @@ class MLASparseAttentionImplPluginModeMethods:
         req_id_i32 = sparse_meta.req_id_per_token.to(dtype=torch.int32)
         block_table_i32 = sparse_meta.block_table.to(dtype=torch.int32)
         topk_indices_i32 = topk_indices.to(dtype=torch.int32)
+        _probe_c_log_sparse_forward(
+            "sparse_forward_before_convert",
+            layer_num=self.layer_num,
+            num_actual_toks=num_actual_toks,
+            sparse_meta=sparse_meta,
+            topk_indices=topk_indices_i32,
+        )
         triton_convert_req_index_to_global_index(
             req_id_i32,
             sparse_meta.slot_mapping,
@@ -479,6 +570,13 @@ class MLASparseAttentionImplPluginModeMethods:
             sparse_meta.paged_kv_indices,
             BLOCK_SIZE=sparse_meta.block_size,
             NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
+        )
+        _probe_c_log_sparse_forward(
+            "sparse_forward_after_convert",
+            layer_num=self.layer_num,
+            num_actual_toks=num_actual_toks,
+            sparse_meta=sparse_meta,
+            topk_indices=topk_indices_i32,
         )
         if fp8_attention:
             from vllm import _custom_ops as ops
@@ -714,6 +812,18 @@ def sparse_attn_indexer_plugin_mode(
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        _probe_c_log_topk_decode(
+            "indexer_decode_before_topk",
+            k_cache_prefix=k_cache_prefix,
+            topk_indices=topk_indices,
+            topk_indices_buffer=topk_indices_buffer,
+            decode_metadata=decode_metadata,
+            decode_lens=decode_lens,
+            batch_size=batch_size,
+            next_n=next_n,
+            num_decode_tokens=num_decode_tokens,
+            num_padded_tokens=num_padded_tokens,
+        )
         top_k_per_row_decode(
             logits,
             next_n,
@@ -722,6 +832,18 @@ def sparse_attn_indexer_plugin_mode(
             num_rows,
             logits.stride(0),
             logits.stride(1),
+        )
+        _probe_c_log_topk_decode(
+            "indexer_decode_after_topk",
+            k_cache_prefix=k_cache_prefix,
+            topk_indices=topk_indices,
+            topk_indices_buffer=topk_indices_buffer,
+            decode_metadata=decode_metadata,
+            decode_lens=decode_lens,
+            batch_size=batch_size,
+            next_n=next_n,
+            num_decode_tokens=num_decode_tokens,
+            num_padded_tokens=num_padded_tokens,
         )
 
         if decode_metadata.requires_padding:

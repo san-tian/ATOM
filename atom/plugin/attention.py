@@ -1811,6 +1811,37 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
         topk_indices_global = self.topk_indices_global[:num_tokens]
 
+        from atom.utils.debug_helper import sparse_replay
+
+        if sparse_replay.should_log_layer(getattr(self, "layer_num", None)):
+            sparse_replay.maybe_log(
+                "builder_before_mla_metadata",
+                layer_num=getattr(self, "layer_num", None),
+                num_tokens=int(num_tokens),
+                num_reqs=int(common_attn_metadata.num_reqs),
+                max_query_len=int(common_attn_metadata.max_query_len),
+                max_seq_len=int(common_attn_metadata.max_seq_len),
+                query_start_loc_tail=sparse_replay.tensor_tail(
+                    common_attn_metadata.query_start_loc, 8
+                ),
+                query_start_loc_last=int(
+                    common_attn_metadata.query_start_loc[-1].item()
+                ),
+                paged_kv_indptr_head=sparse_replay.tensor_head(self.paged_kv_indptr, 8),
+                paged_kv_indptr_at_num_tokens=int(
+                    self.paged_kv_indptr[num_tokens].item()
+                ),
+                paged_kv_indptr_tail_after_num_tokens=sparse_replay.tensor_head(
+                    self.paged_kv_indptr[num_tokens + 1 :], 4
+                ),
+                paged_kv_indices_stats=sparse_replay.tensor_stats(
+                    self.paged_kv_indices
+                ),
+                topk_indices_global_stats=sparse_replay.tensor_stats(
+                    self.topk_indices_global
+                ),
+            )
+
         # ----- Compute persistent MLA metadata -----
         # The aiter sparse decode kernel uses qseqlen=1 (each query token is
         # treated as its own batch entry), so persistent metadata can always
@@ -1841,6 +1872,32 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
             uni_seqlen_qo=1,
             fast_mode=True,
         )
+
+        if sparse_replay.should_log_layer(getattr(self, "layer_num", None)):
+            sparse_replay.maybe_log(
+                "builder_after_mla_metadata",
+                layer_num=getattr(self, "layer_num", None),
+                num_tokens=int(num_tokens),
+                paged_kv_indptr_head=sparse_replay.tensor_head(self.paged_kv_indptr, 8),
+                paged_kv_indptr_at_num_tokens=int(
+                    self.paged_kv_indptr[num_tokens].item()
+                ),
+                paged_kv_indptr_tail_after_num_tokens=sparse_replay.tensor_head(
+                    self.paged_kv_indptr[num_tokens + 1 :], 4
+                ),
+                paged_kv_indices_stats=sparse_replay.tensor_stats(
+                    self.paged_kv_indices
+                ),
+                topk_indices_global_stats=sparse_replay.tensor_stats(
+                    self.topk_indices_global
+                ),
+                work_meta_data=sparse_replay.checksum(self._mla_work_meta_data),
+                work_indptr=sparse_replay.checksum(self._mla_work_indptr),
+                work_info_set=sparse_replay.checksum(self._mla_work_info_set),
+                reduce_indptr=sparse_replay.checksum(self._mla_reduce_indptr),
+                reduce_final_map=sparse_replay.checksum(self._mla_reduce_final_map),
+                reduce_partial_map=sparse_replay.checksum(self._mla_reduce_partial_map),
+            )
 
         attn_metadata_for_plugin_mode = AiterMLASparseMetadataForPluginMode(
             num_reqs=common_attn_metadata.num_reqs,
@@ -2302,6 +2359,11 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         self.model_dtype = self.model_config.dtype
         self.kv_cache_spec = kv_cache_spec
         self.device = device
+        self.layer_num = None
+        if layer_names:
+            from atom.models.utils import extract_layer_index
+
+            self.layer_num = extract_layer_index(layer_names[0])
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 

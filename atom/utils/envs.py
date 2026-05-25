@@ -146,6 +146,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sampler top-K logits log — int K, 0/empty disables.
     "ATOM_DEBUG_TOPK": lambda: int(os.getenv("ATOM_DEBUG_TOPK", "0") or "0"),
     "ATOM_DEBUG_TOPK_PATH": lambda: os.getenv("ATOM_DEBUG_TOPK_PATH", ""),
+    # Sparse MLA replay probe — JSONL path, empty disables.
+    "ATOM_SPARSE_REPLAY_C_PATH": lambda: os.getenv("ATOM_SPARSE_REPLAY_C_PATH", ""),
+    "ATOM_SPARSE_REPLAY_C_LAYERS": lambda: os.getenv(
+        "ATOM_SPARSE_REPLAY_C_LAYERS", "0"
+    ),
+    "ATOM_SPARSE_REPLAY_C_INTERVAL": lambda: int(
+        os.getenv("ATOM_SPARSE_REPLAY_C_INTERVAL", "128") or "128"
+    ),
+    "ATOM_SPARSE_REPLAY_C_MAX_RECORDS": lambda: int(
+        os.getenv("ATOM_SPARSE_REPLAY_C_MAX_RECORDS", "20000") or "20000"
+    ),
 }
 
 
