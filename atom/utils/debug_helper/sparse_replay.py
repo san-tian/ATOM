@@ -30,6 +30,13 @@ def enabled() -> bool:
     return bool(envs.ATOM_SPARSE_REPLAY_C_PATH) and _get_rank() == 0
 
 
+def is_graph_capturing() -> bool:
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except RuntimeError:
+        return False
+
+
 def _layer_set() -> set[int] | None:
     raw = envs.ATOM_SPARSE_REPLAY_C_LAYERS
     if raw == "*":
@@ -38,7 +45,7 @@ def _layer_set() -> set[int] | None:
 
 
 def should_log_layer(layer_num: int | None) -> bool:
-    if not enabled():
+    if not enabled() or is_graph_capturing():
         return False
     layers = _layer_set()
     return layers is None or (layer_num is not None and layer_num in layers)
@@ -115,7 +122,7 @@ def maybe_log(event: str, **fields: Any) -> None:
     global _COUNT
 
     path = envs.ATOM_SPARSE_REPLAY_C_PATH
-    if not path or _get_rank() != 0:
+    if not path or _get_rank() != 0 or is_graph_capturing():
         return
 
     with _LOCK:
