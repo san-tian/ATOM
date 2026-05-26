@@ -17,6 +17,9 @@ set +a
 : "${VLLM_METRICS_SCHEME:=http}"
 : "${VLLM_METRICS_PATH:=/metrics}"
 : "${VLLM_SCRAPE_INTERVAL:=5s}"
+: "${OBSERVABILITY_SINGLE_PORT:=false}"
+: "${OBSERVABILITY_GATEWAY_PORT:=7777}"
+: "${VLLM_API_TARGET:=$VLLM_METRICS_TARGET}"
 
 mkdir -p "$ROOT_DIR/prometheus"
 
@@ -27,11 +30,35 @@ sed \
   -e "s|\${VLLM_SCRAPE_INTERVAL}|${VLLM_SCRAPE_INTERVAL}|g" \
   "$ROOT_DIR/prometheus/prometheus.yml.tpl" > "$ROOT_DIR/prometheus/prometheus.yml"
 
-docker compose --env-file "$ENV_FILE" -f "$ROOT_DIR/docker-compose.yml" up -d
+COMPOSE_FILES=(-f "$ROOT_DIR/docker-compose.yml")
+if [[ "$OBSERVABILITY_SINGLE_PORT" == "1" || "$OBSERVABILITY_SINGLE_PORT" == "true" || "$OBSERVABILITY_SINGLE_PORT" == "yes" ]]; then
+  sed \
+    -e "s|\${OBSERVABILITY_GATEWAY_PORT}|${OBSERVABILITY_GATEWAY_PORT}|g" \
+    -e "s|\${VLLM_API_TARGET}|${VLLM_API_TARGET}|g" \
+    "$ROOT_DIR/Caddyfile.tpl" > "$ROOT_DIR/Caddyfile"
+  COMPOSE_FILES+=(-f "$ROOT_DIR/docker-compose.gateway.yml")
+else
+  COMPOSE_FILES+=(-f "$ROOT_DIR/docker-compose.ports.yml")
+fi
+
+docker compose --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" up -d
 
 cat <<EOF
 Observability stack is starting.
-Prometheus: http://127.0.0.1:${PROMETHEUS_PORT:-9090}
-Grafana:    http://127.0.0.1:${GRAFANA_PORT:-3000}
 Dashboard:  ATOM / ATOM vLLM Overview
 EOF
+
+if [[ "$OBSERVABILITY_SINGLE_PORT" == "1" || "$OBSERVABILITY_SINGLE_PORT" == "true" || "$OBSERVABILITY_SINGLE_PORT" == "yes" ]]; then
+  cat <<EOF
+Single-port gateway: http://127.0.0.1:${OBSERVABILITY_GATEWAY_PORT}
+Inference API:       http://127.0.0.1:${OBSERVABILITY_GATEWAY_PORT}/v1/models
+vLLM metrics:        http://127.0.0.1:${OBSERVABILITY_GATEWAY_PORT}/metrics
+Grafana:             http://127.0.0.1:${OBSERVABILITY_GATEWAY_PORT}/grafana/
+Prometheus:          http://127.0.0.1:${OBSERVABILITY_GATEWAY_PORT}/prometheus/
+EOF
+else
+  cat <<EOF
+Prometheus: http://127.0.0.1:${PROMETHEUS_PORT:-9090}
+Grafana:    http://127.0.0.1:${GRAFANA_PORT:-3000}
+EOF
+fi

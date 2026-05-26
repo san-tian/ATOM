@@ -30,6 +30,38 @@ Open:
 - Default Grafana login: `admin` / `admin`
 - Dashboard: `ATOM / ATOM vLLM Overview`
 
+## Single External Port with Caddy
+
+When only one external port is available, enable the Caddy gateway. This keeps
+Prometheus and Grafana internal to Docker and publishes only one host port,
+defaulting to `7777`.
+
+```bash
+cd deploy/observability
+cp .env.example .env
+
+cat >> .env <<'EOF'
+OBSERVABILITY_SINGLE_PORT=true
+OBSERVABILITY_GATEWAY_PORT=7777
+VLLM_API_TARGET=host.docker.internal:7791
+VLLM_METRICS_TARGET=host.docker.internal:7791
+GRAFANA_ROOT_URL=http://<host-ip>:7777/grafana/
+PROMETHEUS_EXTERNAL_URL=http://<host-ip>:7777/prometheus/
+EOF
+
+./start-observability.sh
+```
+
+External routes:
+
+- vLLM OpenAI-compatible API: `http://<host-ip>:7777/v1/models`
+- vLLM metrics: `http://<host-ip>:7777/metrics`
+- Grafana: `http://<host-ip>:7777/grafana/`
+- Prometheus: `http://<host-ip>:7777/prometheus/`
+
+The vLLM server still listens on its local service port, for example `7791`.
+Caddy is the only service that needs to bind an externally reachable host port.
+
 ## Connect a vLLM Service
 
 The only required vLLM side is that the server exposes `/metrics` on its HTTP
