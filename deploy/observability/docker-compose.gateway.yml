@@ -1,0 +1,34 @@
+services:
+  prometheus:
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+      - --web.external-url=${PROMETHEUS_EXTERNAL_URL:-http://localhost:7777/prometheus/}
+      - --web.route-prefix=/prometheus
+
+  grafana:
+    environment:
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:7777/grafana/}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+
+  caddy:
+    image: caddy:2.8.4-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-atom-observability}-caddy
+    depends_on:
+      - prometheus
+      - grafana
+    ports:
+      - "${OBSERVABILITY_GATEWAY_PORT:-7777}:${OBSERVABILITY_GATEWAY_PORT:-7777}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    extra_hosts:
+      - "${HOST_GATEWAY_NAME:-host.docker.internal}:${HOST_GATEWAY_IP:-host-gateway}"
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:
